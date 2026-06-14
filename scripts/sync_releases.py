@@ -1,15 +1,17 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+# ✅ 通用化配置：从环境变量读取
 UPSTREAM = os.environ.get("UPSTREAM_REPO")
 TARGET = os.environ.get("TARGET_REPO", os.environ.get("TARGET"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "5"))
 INCREMENTAL_SYNC = os.environ.get("INCREMENTAL_SYNC", "true").lower() == "true"
-SYNC_ORDER = os.environ.get("SYNC_ORDER", "oldest_to_newest")
+SYNC_ORDER = os.environ.get("SYNC_ORDER", "oldest_to_newest")  # oldest_to_newest / newest_to_oldest
 RATE_LIMIT_RETRY = int(os.environ.get("RATE_LIMIT_RETRY", "3"))
 SLEEP_ON_RATE_LIMIT = int(os.environ.get("SLEEP_ON_RATE_LIMIT", "60"))
 
@@ -17,6 +19,7 @@ STATE_FILE = Path("/tmp/sync-state.json")
 
 
 def sh(cmd, check=True, max_retries=RATE_LIMIT_RETRY):
+    """Run shell command with rate limit retry"""
     last_result = None
     for i in range(max_retries):
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -25,8 +28,8 @@ def sh(cmd, check=True, max_retries=RATE_LIMIT_RETRY):
         if result.returncode == 0:
             return result
 
-        stderr = result.stderr or ""
-        if "403" in stderr and "rate limit" in stderr.lower():
+        stderr = (result.stderr or "")
+        if "403" in stderr and ("rate limit" in stderr.lower()):
             wait_time = SLEEP_ON_RATE_LIMIT * (i + 1)
             print(f"⚠ Rate limit hit, waiting {wait_time}s... (attempt {i+1}/{max_retries})")
             time.sleep(wait_time)
@@ -43,7 +46,28 @@ def sh(cmd, check=True, max_retries=RATE_LIMIT_RETRY):
     return last_result
 
 
+def get_releases(repo):
+    """Get all releases using gh CLI"""
+    r = sh(f'gh release list -R "{repo}" --limit 500', check=False)
+
+    if r.returncode != 0:
+        print(f"Failed to get releases: {r.stderr}")
+        return []
+
+    releases = []
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        tag = parts[0].strip()
+        name = parts[1].strip() if len(parts) > 1 else tag
+        releases.append({"tag_name": tag, "name": name})
+
+    return releases
+
+
 def is_valid_tag(tag: str) -> bool:
+    """跳过非法 tag：空值、包含空格、过长或不规范字符"""
     if not tag:
         return False
     if " " in tag:
@@ -51,33 +75,10 @@ def is_valid_tag(tag: str) -> bool:
     return True
 
 
-def get_releases(repo):
-    r = sh(
-        f'gh release list -R "{repo}" --limit 500 --order asc --json tagName,name,publishedAt,isDraft,isPrerelease',
-        check=False
-    )
-    if r.returncode != 0:
-        print(f"Failed to get releases: {r.stderr}")
-        return []
-
-    data = json.loads(r.stdout)
-    releases = []
-    for item in data:
-        if item.get("isDraft"):
-            continue
-        releases.append({
-            "tag_name": item.get("tagName"),
-            "name": item.get("name") or item.get("tagName"),
-            "published_at": item.get("publishedAt"),
-            "is_prerelease": item.get("isPrerelease", False),
-        })
-
-    return releases
-
-
 def get_release_detail(repo, release_tag):
+    """获取单个 release 的完整信息：name / body / assets"""
     r = sh(
-        f'gh release view "{release_tag}" -R "{repo}" --json tagName,name,body,assets,publishedAt,isPrerelease',
+        f'gh release view "{release_tag}" -R "{repo}" --json tagName,name,body,assets',
         check=False
     )
     if r.returncode != 0:
@@ -87,11 +88,13 @@ def get_release_detail(repo, release_tag):
 
 
 def release_exists(tag, repo):
+    """Check if release exists"""
     r = sh(f'gh release view "{tag}" -R "{repo}" >/dev/null 2>&1', check=False)
     return r.returncode == 0
 
 
 def create_release(tag, repo, name, body, prerelease=False, draft=False):
+    """Create a new release"""
     prerelease_flag = "--prerelease" if prerelease else ""
     draft_flag = "--draft" if draft else ""
 
@@ -110,7 +113,9 @@ def create_release(tag, repo, name, body, prerelease=False, draft=False):
 
 
 def get_release_assets(repo, release_tag):
+    """Get all assets for a release using gh CLI --json"""
     r = sh(f'gh release view "{release_tag}" -R "{repo}" --json assets', check=False)
+
     if r.returncode != 0:
         print(f"Failed to get assets for {release_tag}: {r.stderr}")
         return []
@@ -126,6 +131,7 @@ def get_release_assets(repo, release_tag):
 
 
 def release_has_missing_assets(release_tag, repo):
+    """Check if release has missing assets compared to upstream"""
     r = sh(f'gh release view "{release_tag}" -R "{UPSTREAM}" --json assets', check=False)
     if r.returncode != 0:
         return False
@@ -150,6 +156,7 @@ def release_has_missing_assets(release_tag, repo):
 
 
 def sync_assets(release_tag, repo):
+    """Sync all assets from source to target"""
     work = Path("/tmp/release-sync")
     work.mkdir(parents=True, exist_ok=True)
 
@@ -218,6 +225,7 @@ def sync_assets(release_tag, repo):
 
 
 def sync_assets_to_existing_release(release_tag):
+    """Sync missing assets to an existing release"""
     work = Path("/tmp/release-sync")
     work.mkdir(parents=True, exist_ok=True)
 
@@ -314,25 +322,23 @@ def main():
         print(f"Unknown SYNC_ORDER: {SYNC_ORDER}, using oldest_to_newest")
         upstream = list(reversed(upstream))
 
-    if INCREMENTAL_SYNC and STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            last_published_at = data.get("last_sync_published_at")
-        except Exception as e:
-            print(f"⚠ Failed to read sync state: {e}")
-            last_published_at = None
+    if INCREMENTAL_SYNC:
+        if STATE_FILE.exists():
+            try:
+                data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+                last_tag = data.get("last_sync_tag")
+            except Exception as e:
+                print(f"⚠ Failed to read sync state: {e}")
+                last_tag = None
 
-        if last_published_at:
-            upstream = [
-                r for r in upstream
-                if r.get("published_at") and r["published_at"] > last_published_at
-            ]
-            print(f"Incremental sync: skipping releases before {last_published_at}")
-            print(f" Remaining: {len(upstream)} releases")
+            if last_tag:
+                upstream = [r for r in upstream if r["tag_name"] > last_tag]
+                print(f"Incremental sync: skipping releases before {last_tag}")
+                print(f" Remaining: {len(upstream)} releases")
 
     success_count = 0
     assets_synced_count = 0
-    last_synced_release = None
+    last_synced_tag = None
 
     for idx, rel in enumerate(upstream, 1):
         tag = rel["tag_name"]
@@ -348,8 +354,6 @@ def main():
 
         name = detail.get("name") or rel.get("name") or tag
         body = detail.get("body") or f"Synced from upstream {UPSTREAM}"
-        published_at = detail.get("publishedAt") or rel.get("published_at")
-        is_prerelease = detail.get("isPrerelease", False)
 
         print(f"\n[{idx}/{len(upstream)}] Processing release {tag}")
 
@@ -361,29 +365,20 @@ def main():
                     assets_synced_count += 1
             else:
                 print(f" Release {tag} already exists with all assets, skipping")
-            last_synced_release = {
-                "tag_name": tag,
-                "published_at": published_at,
-            }
+            last_synced_tag = tag
             continue
 
-        if create_release(tag, TARGET, name, body, prerelease=is_prerelease):
+        if create_release(tag, TARGET, name, body):
             if sync_assets(tag, UPSTREAM):
                 success_count += 1
-            last_synced_release = {
-                "tag_name": tag,
-                "published_at": published_at,
-            }
+            last_synced_tag = tag
 
-    if INCREMENTAL_SYNC and last_synced_release and last_synced_release.get("published_at"):
+    if INCREMENTAL_SYNC and last_synced_tag:
         STATE_FILE.write_text(
-            json.dumps({
-                "last_sync_tag": last_synced_release["tag_name"],
-                "last_sync_published_at": last_synced_release["published_at"],
-            }),
+            json.dumps({"last_sync_tag": last_synced_tag}),
             encoding="utf-8"
         )
-        print(f"\nSaved sync state: {last_synced_release}")
+        print(f"\nSaved sync state: last_sync_tag = {last_synced_tag}")
 
     print("\n" + "=" * 60)
     print("Sync complete:")
